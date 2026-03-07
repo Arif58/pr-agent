@@ -1,5 +1,7 @@
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional
 import hmac
 import hashlib
 import json
@@ -14,12 +16,22 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="PR Reviewer Agent",
-    description="AI-powered Pull Request reviewer using LangChain and Ollama",
+    description="AI-powered Pull Request reviewer using LangChain",
     version="1.0.0"
 )
 
-# Initialize the PR reviewer agent
+# Initialize default PR reviewer agent (for webhooks)
 pr_agent = PRReviewerAgent()
+
+
+class ManualReviewRequest(BaseModel):
+    """Request body for manual review endpoint."""
+    platform: Optional[str] = "github"  # "github" or "gitlab"
+    platform_token: str  # GitHub PAT or GitLab token
+    llm_provider: str = "ollama"  # "ollama", "gemini", or "openai"
+    llm_model: Optional[str] = None  # e.g. "llama3.2", "gemini-2.0-flash", "gpt-4-turbo-preview"
+    api_key: Optional[str] = None  # Required for gemini/openai, not needed for ollama
+
 
 def verify_webhook_signature(payload: bytes, signature: str, platform: str) -> bool:
     """Unified webhook signature verification."""
@@ -33,13 +45,13 @@ def verify_webhook_signature(payload: bytes, signature: str, platform: str) -> b
         expected = hmac.new(secret, payload, hashlib.sha256).hexdigest()
         return hmac.compare_digest(f"sha256={expected}", signature)
     
-async def process_review(identifier: str, number: int, commit_sha: str = None):
+async def process_review(agent: PRReviewerAgent, identifier: str, number: int, commit_sha: str = None):
     """Unified background task to process PR/MR review."""
     try:
-        action_type = "MR" if pr_agent.platform == "gitlab" else "PR"
+        action_type = "MR" if agent.platform == "gitlab" else "PR"
         logger.info(f"Processing {action_type} review for {identifier}#{number}")
         
-        result = pr_agent.review_pr(identifier, number, commit_sha)
+        result = agent.review_pr(identifier, number, commit_sha)
         
         if result["success"]:
             logger.info(f"{action_type} review completed successfully for {identifier}#{number}")
@@ -47,7 +59,7 @@ async def process_review(identifier: str, number: int, commit_sha: str = None):
             logger.error(f"{action_type} review failed for {identifier}#{number}: {result['message']}")
             
     except Exception as e:
-        logger.error(f"Error in background {action_type} review: {e}")
+        logger.error(f"Error in background review: {e}")
 
 
 @app.post("/webhook/gitlab")
@@ -74,6 +86,7 @@ async def gitlab_webhook(request: Request, background_tasks: BackgroundTasks):
                 
                 background_tasks.add_task(
                     process_review,
+                    pr_agent,
                     str(project_id),
                     mr_iid,
                     commit_sha
@@ -121,7 +134,8 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                 
                 # Add review task to background queue
                 background_tasks.add_task(
-                    process_review, 
+                    process_review,
+                    pr_agent,
                     repo_name, 
                     pr_number, 
                     commit_sha
@@ -144,27 +158,55 @@ async def health_check():
     return {"status": "healthy", "agent": "PR Reviewer Agent"}
 
 @app.post("/review/{owner}/{repo}/{pr_number}")
-async def manual_review(owner: str, repo: str, pr_number: int, background_tasks: BackgroundTasks):
-    """Manually trigger a PR review."""
+async def manual_review(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    body: ManualReviewRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Manually trigger a PR/MR review with dynamic LLM and token configuration."""
     try:
+        # Validate: gemini/openai require an api_key
+        if body.llm_provider in ("gemini", "openai") and not body.api_key:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'api_key' is required when using '{body.llm_provider}' as llm_provider."
+            )
+
+        # Create a fresh agent with caller-provided config
+        agent = PRReviewerAgent(
+            llm_provider=body.llm_provider,
+            llm_model=body.llm_model,
+            api_key=body.api_key,
+            platform=body.platform,
+            platform_token=body.platform_token,
+        )
+
         repo_name = f"{owner}/{repo}"
-        
+
         # Get the latest commit SHA
-        if pr_agent.platform == "gitlab":
-            pr_details = pr_agent.platform_tools.get_mr_details(repo_name, pr_number)
-            commit_sha = pr_details.get("sha", "main")  # GitLab field name
+        if agent.platform == "gitlab":
+            pr_details = agent.platform_tools.get_mr_details(repo_name, pr_number)
         else:
-            pr_details = pr_agent.platform_tools.get_pr_details(repo_name, pr_number)  
-            commit_sha = pr_details.get("sha", "main")  # GitHub field name
-        
+            pr_details = agent.platform_tools.get_pr_details(repo_name, pr_number)
+        commit_sha = pr_details.get("sha", "main")
+
         # Add review task to background queue
-        background_tasks.add_task(process_review, repo_name, pr_number, commit_sha)
-        
+        background_tasks.add_task(process_review, agent, repo_name, pr_number, commit_sha)
+
         return JSONResponse({
             "status": "success",
-            "message": f"Manual review queued for {repo_name}#{pr_number}"
+            "message": f"Manual review queued for {repo_name}#{pr_number}",
+            "config": {
+                "platform": body.platform,
+                "llm_provider": body.llm_provider,
+                "llm_model": body.llm_model or "default",
+            }
         })
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Manual review error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

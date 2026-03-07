@@ -1,6 +1,5 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_ollama import ChatOllama
 from langchain.prompts import ChatPromptTemplate
 from langchain.memory import ConversationBufferMemory
 from langchain.schema import SystemMessage, HumanMessage
@@ -12,34 +11,75 @@ from ..utils.config import settings
 
 logger = logging.getLogger(__name__)
 
-class PRReviewerAgent:
-    def __init__(self):
-        self.llm = ChatOllama(
-            model=settings.ollama_model,
+LLM_DEFAULTS = {
+    "ollama": {"model": "llama3.2"},
+    "gemini": {"model": "gemini-2.0-flash"},
+    "openai": {"model": "gpt-4-turbo-preview"},
+}
+
+
+def create_llm(provider: str, model: Optional[str] = None, api_key: Optional[str] = None):
+    """Create LLM instance based on provider selection."""
+    provider = provider.lower()
+    model = model or LLM_DEFAULTS.get(provider, {}).get("model")
+
+    if provider == "ollama":
+        from langchain_ollama import ChatOllama
+        return ChatOllama(
+            model=model or settings.ollama_model,
             base_url=settings.ollama_base_url,
-            temperature=0.1  # Lower temperature for consistent reviews
+            temperature=0.1,
         )
-        
-        self.platform = settings.platform.lower()
+    elif provider == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(
+            model=model,
+            google_api_key=api_key,
+            temperature=0.1,
+        )
+    elif provider == "openai":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            temperature=0.1,
+        )
+    else:
+        raise ValueError(f"Unsupported LLM provider: '{provider}'. Use 'ollama', 'gemini', or 'openai'.")
+
+
+class PRReviewerAgent:
+    def __init__(
+        self,
+        llm_provider: str = "ollama",
+        llm_model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        platform: Optional[str] = None,
+        platform_token: Optional[str] = None,
+    ):
+        self.llm = create_llm(llm_provider, llm_model, api_key)
+
+        self.platform = (platform or settings.platform).lower()
         self.memory = ConversationBufferMemory(return_messages=True)
-        
+
         # Initialize platform-specific tools
         if self.platform == "gitlab":
-            self.platform_tools = GitLabTools(settings.gitlab_token, settings.gitlab_url)
-            self.github_tools = self.platform_tools
+            token = platform_token or settings.gitlab_token
+            self.platform_tools = GitLabTools(token, settings.gitlab_url)
             self.tools = [
                 GetMRDetailsTool(gitlab_tools=self.platform_tools),
                 PostMRNoteTool(gitlab_tools=self.platform_tools)
             ]
             self.review_type = "Merge Request"
         else:  # GitHub
-            self.platform_tools = GitHubTools(settings.github_token)
-            self.github_tools = self.platform_tools
+            token = platform_token or settings.github_token
+            self.platform_tools = GitHubTools(token)
             self.tools = [
                 GetPRDetailsTool(github_tools=self.platform_tools),
-                PostReviewTool(github_tools=self.platform_tools)   
+                PostReviewTool(github_tools=self.platform_tools)
             ]
-            self.review_type = "Pull Request"        
+            self.review_type = "Pull Request"
+
         # Create the agent
         self.agent = self._create_agent()
     
